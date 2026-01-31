@@ -1,0 +1,6 @@
+/target
+*.db
+*.gpkg
+*.sqlite3
+*.sqlite
+*.log

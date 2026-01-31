@@ -1,0 +1,26 @@
+[package]
+name = "geopackage"
+version = "26.1.0"
+description = "A SQLite Geopackage implementation"
+authors = ["Maxwell"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+license-file = "LICENSE"
+readme = "README.md"
+
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "gpkg_lib"
+crate-type = ["cdylib", "staticlib"]
+#crate-type = ["staticlib", "cdylib", "rlib"]
+
+
+[dependencies]
+rusqlite = { version = "0.38", features = ["load_extension"] }
+# libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
