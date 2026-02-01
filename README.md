@@ -12,6 +12,10 @@ MIT OR Apache-2.0
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
 
+## Acknowledgments
+
+This project was built with the assistance of **Claude Code**.
+
 
 # Dependencies
 
