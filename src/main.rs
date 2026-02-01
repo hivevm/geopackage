@@ -1,170 +1,245 @@
-use rusqlite::{Connection, Result, ffi, params};
-use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_void};
-use std::ptr;
-//use libsqlite3_sys as ffi;
+mod cli_state;
+mod completion;
+mod db;
+mod dot_commands;
+mod import_export;
+mod lsp;
+mod output;
+mod repl;
+mod sql_executor;
+mod sql_highlight;
 
-// Callback-Funktion für eine benutzerdefinierte SQL-Funktion
-unsafe extern "C" fn my_function(
-    context: *mut ffi::sqlite3_context,
-    argc: c_int,
-    argv: *mut *mut ffi::sqlite3_value,
-) {
-    if argc != 2 {
-        let err = CString::new("Expected 2 arguments").unwrap();
-        ffi::sqlite3_result_error(context, err.as_ptr(), -1);
-        return;
-    }
+use std::io::{self, Read};
+use std::path::PathBuf;
+use std::process;
 
-    let arg1 = ffi::sqlite3_value_int(*argv.offset(0));
-    let arg2 = ffi::sqlite3_value_int(*argv.offset(1));
-    
-    let result = arg1 + arg2;
-    ffi::sqlite3_result_int(context, result);
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli_state::CliState;
+use rusqlite::Connection;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "rsqlite3",
+    author,
+    version,
+    about = "A drop-in replacement for sqlite3 CLI with enhanced features",
+    long_about = None
+)]
+struct Args {
+    /// Path to the SQLite database file
+    #[arg(value_name = "DATABASE")]
+    database: Option<PathBuf>,
+
+    /// SQL command to execute
+    #[arg(value_name = "SQL")]
+    sql: Option<String>,
+
+    /// Show column headers
+    #[arg(short = 'H', long = "header")]
+    header: bool,
+
+    /// Do not show column headers
+    #[arg(long = "noheader")]
+    noheader: bool,
+
+    /// Set output mode (list, csv, column, json, line, table, markdown)
+    #[arg(short = 'm', long = "mode", value_name = "MODE")]
+    mode: Option<String>,
+
+    /// Set column separator for list mode
+    #[arg(short = 's', long = "separator", value_name = "SEP")]
+    separator: Option<String>,
+
+    /// Set NULL value display string
+    #[arg(short = 'n', long = "nullvalue", value_name = "TEXT")]
+    nullvalue: Option<String>,
+
+    /// Open database in read-only mode
+    #[arg(short = 'r', long = "readonly")]
+    readonly: bool,
+
+    /// Execute SQL from init file before processing
+    #[arg(long = "init", value_name = "FILE")]
+    init: Option<PathBuf>,
+
+    /// Run command before reading stdin
+    #[arg(long = "cmd", value_name = "COMMAND")]
+    cmd: Option<String>,
+
+    /// Echo commands before executing
+    #[arg(short = 'e', long = "echo")]
+    echo: bool,
+
+    /// Stop after hitting an error
+    #[arg(short = 'b', long = "bail")]
+    bail: bool,
+
+    /// Enable color output
+    #[arg(long = "color")]
+    color: bool,
+
+    /// Disable color output
+    #[arg(long = "no-color")]
+    no_color: bool,
 }
 
-unsafe extern "C" fn my_number(
-    ctx: *mut ffi::sqlite3_context,
-    _argc: c_int,
-    _argv: *mut *mut ffi::sqlite3_value,
-) {
-    ffi::sqlite3_result_int64(ctx, 42);
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    }
 }
 
-fn main() -> Result<()> {
-    // Create an in-memory database or file-based database
-    let conn = Connection::open_in_memory()?;
-    // let conn = Connection::open("my_database.db")?;
-    
-    // Enable foreign keys
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
-    // conn.execute("PRAGMA journal_mode = WAL", [])?;  // Write-Ahead Logging
-    // conn.execute("PRAGMA synchronous = NORMAL", [])?;
-    // conn.execute("PRAGMA cache_size = -64000", [])?;  // 64MB cache
+fn run() -> Result<()> {
+    let args = Args::parse();
 
-    // unsafe {
-    //     conn.load_extension_enable()?;
-    //     conn.load_extension(
-    //         "./target/release/libgpkg_lib",
-    //         Some("sqlite3_extension_init")  // Explicitly specify the entry point
-    //     )?;
-    //     conn.load_extension_disable()?;
-    // }
+    // Determine database path
+    let db_path = args
+        .database
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("database.db"));
 
-    // Register function directly - no .so file needed!
-    unsafe {
-        let name = CString::new("my_number").unwrap();
-        ffi::sqlite3_create_function_v2(
-            conn.handle(),
-            name.as_ptr(),
-            0,
-            ffi::SQLITE_UTF8,
-            ptr::null_mut(),
-            Some(my_number),
-            None, None, None,
-        );
+    // Determine mode
+    let is_interactive = args.sql.is_none() && is_terminal::is_terminal(io::stdin());
 
-        let fn_name = CString::new("add_numbers").unwrap();
-        ffi::sqlite3_create_function_v2(
-            conn.handle(),
-            fn_name.as_ptr(),
-            2,  // Anzahl der Argumente
-            ffi::SQLITE_UTF8 | ffi::SQLITE_DETERMINISTIC,
-            std::ptr::null_mut(),
-            Some(my_function),
-            None,
-            None,
-            None,
-        );
+    if is_interactive {
+        // Interactive REPL mode
+        run_interactive(db_path, &args)
+    } else if let Some(sql) = &args.sql {
+        // One-shot SQL mode
+        run_one_shot(db_path, &args, sql)
+    } else {
+        // Piped input mode
+        run_piped(db_path, &args)
+    }
+}
+
+fn run_interactive(db_path: PathBuf, args: &Args) -> Result<()> {
+    let mut repl = repl::Repl::new(db_path)?;
+
+    // Apply CLI options to state
+    configure_state(&mut repl, args)?;
+
+    // Run init file if specified
+    if let Some(init_file) = &args.init {
+        let content = std::fs::read_to_string(init_file)
+            .with_context(|| format!("Failed to read init file: {}", init_file.display()))?;
+
+        let conn = Connection::open(&repl.state.database_path)?;
+        for stmt in content.split(';') {
+            let trimmed = stmt.trim();
+            if !trimmed.is_empty() {
+                let sql = format!("{};", trimmed);
+                sql_executor::execute(&conn, &sql, &mut repl.state)?;
+            }
+        }
     }
 
-    // Create tables
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            email TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )?;
-    
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )",
-        [],
-    )?;
-    
-    // Insert a user
-    conn.execute(
-        "INSERT INTO users (username, email) VALUES (?1, ?2)",
-        params!["alice", "alice@example.com"],
-    )?;
-    
-    let user_id = conn.last_insert_rowid();
-    
-    // Insert a post
-    conn.execute(
-        "INSERT INTO posts (user_id, title, content) VALUES (?1, ?2, ?3)",
-        params![user_id, "My First Post", "Hello, SQLite with Rust!"],
-    )?;
-    
-    // Query with joins
-    let mut stmt = conn.prepare(
-        "SELECT u.username, p.title, p.content, p.created_at 
-         FROM posts p 
-         JOIN users u ON p.user_id = u.id"
-    )?;
-    
-    let posts = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    
-    println!("Posts:");
-    for post in posts {
-        let (username, title, content, created_at) = post?;
-        println!("  [{}] {} by {}: {}", created_at, title, username, content);
+    // Run command if specified
+    if let Some(cmd) = &args.cmd {
+        let conn = Connection::open(&repl.state.database_path)?;
+        if cmd.starts_with('.') {
+            dot_commands::execute(&conn, cmd, &mut repl.state)?;
+        } else {
+            sql_executor::execute(&conn, cmd, &mut repl.state)?;
+        }
     }
-    
-    let result: i64 = conn.query_row("SELECT my_number()", [], |row| row.get(0))?;
-    println!("{}", result);
-    
-    // Transaction example
-    conn.execute_batch(
-        "BEGIN;
-         UPDATE users SET email = 'newemail@example.com' WHERE id = 1;
-         COMMIT;"
-    )?;    // Insert a post
 
+    // Start REPL
+    repl.run()
+}
 
-    let result: i64 = conn.query_row(
-        "SELECT add_numbers(?1, ?2)", 
-        params![1, 5], |row| row.get(0))?;
-    println!("{}", result);  // Prints: 6
+fn run_one_shot(db_path: PathBuf, args: &Args, sql: &str) -> Result<()> {
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-    // Use transactions for bulk inserts:
-    // let tx = conn.transaction()?;
-    // for i in 0..1000 {
-    //     tx.execute("INSERT INTO data (value) VALUES (?1)", [i])?;
-    // }
-    // tx.commit()?;
+    let mut state = CliState::new(db_path);
+    configure_cli_state(&mut state, args)?;
 
-    // // Use transactions for bulk inserts:
-    // let mut stmt = conn.prepare("INSERT INTO data (value) VALUES (?1)")?;
-    // for i in 0..1000 {
-    //     stmt.execute([i])?;
-    // }
-    
+    // Execute the SQL
+    sql_executor::execute(&conn, sql, &mut state)?;
+
+    Ok(())
+}
+
+fn run_piped(db_path: PathBuf, args: &Args) -> Result<()> {
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+
+    let mut state = CliState::new(db_path);
+    configure_cli_state(&mut state, args)?;
+
+    // Read from stdin
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+
+    // Execute each statement
+    for stmt in input.split(';') {
+        let trimmed = stmt.trim();
+        if !trimmed.is_empty() {
+            if trimmed.starts_with('.') {
+                dot_commands::execute(&conn, trimmed, &mut state)?;
+            } else {
+                let sql = format!("{};", trimmed);
+                sql_executor::execute(&conn, &sql, &mut state)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn configure_state(repl: &mut repl::Repl, args: &Args) -> Result<()> {
+    configure_cli_state(&mut repl.state, args)
+}
+
+fn configure_cli_state(state: &mut CliState, args: &Args) -> Result<()> {
+    // Headers
+    if args.header {
+        state.set_headers(true);
+    }
+    if args.noheader {
+        state.set_headers(false);
+    }
+
+    // Output mode
+    if let Some(mode_str) = &args.mode {
+        if let Some(mode) = cli_state::OutputMode::from_str(mode_str) {
+            state.set_mode(mode);
+        } else {
+            eprintln!("Error: mode should be one of: csv column json line list markdown table");
+            process::exit(1);
+        }
+    }
+
+    // Separator
+    if let Some(sep) = &args.separator {
+        state.set_separator(sep.clone());
+    }
+
+    // Null value
+    if let Some(null) = &args.nullvalue {
+        state.set_null_value(null.clone());
+    }
+
+    // Echo
+    if args.echo {
+        state.set_echo(true);
+    }
+
+    // Bail
+    if args.bail {
+        state.set_bail(true);
+    }
+
+    // Color
+    if args.color {
+        state.color_enabled = true;
+    }
+    if args.no_color {
+        state.color_enabled = false;
+    }
+
     Ok(())
 }

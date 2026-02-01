@@ -9,6 +9,11 @@ license-file = "LICENSE"
 readme = "README.md"
 
 
+[[bin]]
+name = "rsqlite3"
+path = "src/main.rs"
+
+
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
@@ -22,5 +27,38 @@ crate-type = ["cdylib", "staticlib"]
 rusqlite = { version = "0.38", features = ["load_extension"] }
 # libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 
-[patch.crates-io]
-libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# REPL
+rustyline = "17.0"
+
+# Terminal
+terminal_size = "0.4"
+is-terminal = "0.4"
+
+# Syntax highlighting
+syntect = "5.3"
+sqlparser = "0.60"
+nu-ansi-term = "0.50"
+
+# Import/Export
+csv = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Utilities
+regex = "1.12"
+chrono = "0.4"
+
+# Logging (optional, for development)
+log = "0.4"
+simplelog = "0.12"
+
+
+[build-dependencies]
+cc = "1.0"
